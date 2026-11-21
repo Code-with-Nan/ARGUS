@@ -73,6 +73,16 @@ class HealthResponse(BaseModel):
     database: str
 
 
+class ReportMetricsResponse(BaseModel):
+    fix_verification_rate: float | None
+    verified_resolutions: int
+    completed_verifications: int
+    regression_count: int
+    average_remediation_seconds: float | None
+    remediation_time_samples: int
+    accuracy_status: str
+
+
 class SecurityReportResponse(BaseModel):
     project_name: str
     scan_id: str
@@ -84,6 +94,7 @@ class SecurityReportResponse(BaseModel):
     findings: list[FindingResponse]
     remediation_status: dict[str, int]
     verification_results: list[dict[str, Any]]
+    metrics: ReportMetricsResponse
     limitations: list[str]
 
 

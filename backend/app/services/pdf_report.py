@@ -102,6 +102,43 @@ def build_scan_pdf(scan: dict[str, Any]) -> bytes:
             )
     else:
         story.append(Paragraph("No remediation verification has been recorded.", body_style))
+
+    metrics = scan.get("metrics") or {}
+    if metrics:
+        rate = metrics.get("fix_verification_rate")
+        average_seconds = metrics.get("average_remediation_seconds")
+        metric_rows = [
+            ["Metric", "Value"],
+            ["Fix verification rate", f"{float(rate) * 100:.1f}%" if rate is not None else "Not available"],
+            ["Regression count", str(int(metrics.get("regression_count") or 0))],
+            [
+                "Average remediation time",
+                f"{float(average_seconds):.1f} seconds"
+                if average_seconds is not None
+                else "Not available",
+            ],
+        ]
+        metric_table = Table(metric_rows, colWidths=[2.5 * inch, 3.5 * inch], repeatRows=1)
+        metric_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbe8ef")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#17324d")),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#aab8c2")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("PADDING", (0, 0), (-1, -1), 5),
+                ]
+            )
+        )
+        story.extend(
+            [
+                Paragraph("Security outcome metrics", styles["Heading2"]),
+                metric_table,
+                Paragraph(escape(str(metrics.get("accuracy_status", ""))), small_style),
+                Spacer(1, 12),
+            ]
+        )
+
     story.append(Paragraph("Limitations", styles["Heading2"]))
     for limitation in scan.get("limitations", []):
         story.append(Paragraph(f"- {escape(str(limitation))}", small_style))

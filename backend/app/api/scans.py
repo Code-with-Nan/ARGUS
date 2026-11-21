@@ -36,6 +36,14 @@ from app.services.security_scanner import scan_project, scanner_catalog
 
 router = APIRouter(prefix="/api/v1/scans", tags=["Security Scans"])
 
+_ACCURACY_STATUS = (
+    "Measured accuracy is not available: no labelled evaluation dataset is configured. "
+    "Fix verification rate is an operational outcome, not model accuracy."
+)
+_COMPLETED_VERIFICATION_STATUSES = frozenset(
+    {"VERIFIED_FIXED", "STILL_PRESENT", "REGRESSION_DETECTED"}
+)
+
 
 def _owned_scan(db: Session, scan_id: str, user: User) -> Scan:
     scan = db.query(Scan).filter(Scan.id == scan_id, Scan.initiated_by_user_id == user.id).first()
@@ -256,6 +264,64 @@ def _remediation_payload(db: Session, item: Remediation) -> dict[str, Any]:
     }
 
 
+def _created_at_sort_key(record: Any) -> datetime:
+    value = record.created_at
+    if value is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def calculate_security_metrics(
+    remediations: list[Remediation],
+    verifications: list[VerificationResult],
+) -> dict[str, Any]:
+    remediation_by_id = {item.id: item for item in remediations}
+    latest_completed: dict[str, VerificationResult] = {}
+    regression_count = 0
+
+    for result in sorted(verifications, key=_created_at_sort_key):
+        if result.remediation_id not in remediation_by_id:
+            continue
+        if result.status == "REGRESSION_DETECTED":
+            regression_count += 1
+        if result.status in _COMPLETED_VERIFICATION_STATUSES:
+            latest_completed[result.remediation_id] = result
+
+    durations: list[float] = []
+    for remediation_id, result in latest_completed.items():
+        remediation = remediation_by_id[remediation_id]
+        if remediation.created_at is None or result.created_at is None:
+            continue
+        try:
+            duration = (_created_at_sort_key(result) - _created_at_sort_key(remediation)).total_seconds()
+        except TypeError:
+            continue
+        if duration >= 0:
+            durations.append(duration)
+
+    verified_resolutions = sum(
+        1
+        for result in latest_completed.values()
+        if result.status == "VERIFIED_FIXED" and result.target_finding_present is False
+    )
+    completed_verifications = len(latest_completed)
+    return {
+        "fix_verification_rate": (
+            verified_resolutions / completed_verifications if completed_verifications else None
+        ),
+        "verified_resolutions": verified_resolutions,
+        "completed_verifications": completed_verifications,
+        "regression_count": regression_count,
+        "average_remediation_seconds": (
+            sum(durations) / len(durations) if durations else None
+        ),
+        "remediation_time_samples": len(durations),
+        "accuracy_status": _ACCURACY_STATUS,
+    }
+
+
 def _scan_payload(db: Session, scan: Scan, include_findings: bool) -> dict[str, Any]:
     metadata = db.get(ScanMetadata, scan.id)
     payload: dict[str, Any] = {
@@ -298,6 +364,15 @@ def _security_report(db: Session, scan: Scan) -> dict[str, Any]:
     for item in remediations:
         remediation_status[item.status] = remediation_status.get(item.status, 0) + 1
         verification_results.extend(_remediation_payload(db, item)["verifications"])
+    remediation_ids = [item.id for item in remediations]
+    verification_rows = (
+        db.query(VerificationResult)
+        .filter(VerificationResult.remediation_id.in_(remediation_ids))
+        .all()
+        if remediation_ids
+        else []
+    )
+    metrics = calculate_security_metrics(remediations, verification_rows)
     scanner_results = payload.get("scanner_results", {})
     limitations = [
         f"{name} scanner status: {result.get('status', 'unknown')}"
@@ -305,6 +380,7 @@ def _security_report(db: Session, scan: Scan) -> dict[str, Any]:
         if result.get("status") != "completed"
     ]
     limitations.append("A completed scan is point-in-time evidence and does not prove the project is secure.")
+    limitations.append(_ACCURACY_STATUS)
     return {
         "project_name": scan.project_name,
         "scan_id": scan.id,
@@ -316,6 +392,7 @@ def _security_report(db: Session, scan: Scan) -> dict[str, Any]:
         "findings": payload["findings"],
         "remediation_status": remediation_status,
         "verification_results": verification_results,
+        "metrics": metrics,
         "limitations": limitations,
     }
 

@@ -1,6 +1,7 @@
 import io
 import json
 import zipfile
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from app.core.database import Base, get_db
 from app.dependencies.auth import get_current_user
 from app.models import Finding, FindingDetails, Remediation, Scan, ScanMetadata, VerificationResult
 from app.models.auth import User
+from app.schemas.scans import SecurityReportResponse
 from app.services.ai_explainer import explain_finding
 from app.services import ai_explainer
 from app.services.pdf_report import build_scan_pdf
