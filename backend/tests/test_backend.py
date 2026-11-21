@@ -13,7 +13,9 @@ from sqlalchemy.pool import StaticPool
 from app.api import scans as scans_api
 from app.core.config import settings
 from app.core.database import Base, get_db
+from app.dependencies.auth import get_current_user
 from app.models import Finding, FindingDetails, Remediation, Scan, ScanMetadata, VerificationResult
+from app.models.auth import User
 from app.services.ai_explainer import explain_finding
 from app.services import ai_explainer
 from app.services.pdf_report import build_scan_pdf
@@ -41,10 +43,23 @@ def client(tmp_path, monkeypatch):
             session.close()
 
     app.dependency_overrides[get_db] = override_get_db
+
+    db = session_factory()
+    demo_user = User(
+        id="test-user",
+        email="scans@example.com",
+        display_name="Scan Test User",
+        password_hash="test-hash",
+        is_active=True,
+    )
+    db.add(demo_user)
+    db.commit()
+    app.dependency_overrides[get_current_user] = lambda: demo_user
     monkeypatch.setattr(settings, "workspace_dir", str(tmp_path / "workspaces"))
     monkeypatch.setattr(settings, "api_token", None)
     with TestClient(app) as test_client:
         yield test_client
+    db.close()
     engine.dispose()
 
 
@@ -112,7 +127,7 @@ def test_upload_history_details_explanation_and_pdf(client, monkeypatch):
         "/api/v1/scans/upload",
         files={"file": ("demo.zip", _zip_file("app.py", "eval(input())\n"), "application/zip")},
     )
-    assert response.status_code == 200
+    assert response.status_code == 201
     scan = response.json()
     assert scan["total_findings"] == 1
     finding = scan["findings"][0]
@@ -163,7 +178,7 @@ def test_remediation_requires_approval_and_followup_scan(client, monkeypatch):
     assert approved.status_code == 200
     applied = client.post(f"/api/v1/scans/remediations/{remediation_id}/apply")
     assert applied.status_code == 200
-    assert applied.json()["verification"]["status"] == "verified"
+    assert applied.json()["verification"]["status"] == "VERIFIED_FIXED"
     assert applied.json()["verification"]["target_finding_present"] is False
     assert applied.json()["followup_scan"]["scan_id"]
 
@@ -173,7 +188,7 @@ def test_real_bandit_followup_verifies_applied_fix(client):
         "/api/v1/scans/upload",
         files={"file": ("real-bandit.zip", _zip_file("app.py", "value = eval(input())\n"), "application/zip")},
     )
-    assert upload.status_code == 200
+    assert upload.status_code == 201
     initial = upload.json()
     bandit_findings = [item for item in initial["findings"] if item.get("scanner") == "Bandit"]
     assert bandit_findings
@@ -194,7 +209,7 @@ def test_real_bandit_followup_verifies_applied_fix(client):
     assert applied.status_code == 200
     result = applied.json()
     assert result["followup_scan"]["scanner_results"]["Bandit"]["status"] == "completed"
-    assert result["verification"]["status"] == "verified"
+    assert result["verification"]["status"] == "VERIFIED_FIXED"
     assert result["verification"]["target_finding_present"] is False
 
 
@@ -231,7 +246,7 @@ def test_failed_followup_scanner_is_inconclusive(client, monkeypatch):
     )
     applied = client.post(f"/api/v1/scans/remediations/{created['id']}/apply")
     assert applied.status_code == 200
-    assert applied.json()["verification"]["status"] == "inconclusive"
+    assert applied.json()["verification"]["status"] == "VERIFICATION_FAILED"
     assert applied.json()["verification"]["target_finding_present"] is None
 
 
@@ -249,7 +264,7 @@ def test_api_token_protects_upload(client, monkeypatch):
         files={"file": ("demo.zip", archive, "application/zip")},
         headers={"X-API-Key": "local-test-token"},
     )
-    assert authorized.status_code == 200
+    assert authorized.status_code == 201
 
 
 def test_patch_rejects_context_mismatch(tmp_path):
@@ -264,7 +279,7 @@ def test_patch_rejects_context_mismatch(tmp_path):
 def test_fallback_is_explicitly_labelled():
     result = explain_finding({"title": "Unsafe operation", "severity": "HIGH"})
     assert result["source"] == "deterministic_fallback"
-    assert "not an AI response" in result["explanation"]
+    assert "not an AI-generated response" in result["explanation"]
 
 
 def test_configured_ai_provider_uses_https_without_code_by_default(monkeypatch):

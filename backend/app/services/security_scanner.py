@@ -242,30 +242,31 @@ class SemgrepScanner:
         return self._binary() is not None
 
     def scan(self, target: Path, timeout: int) -> ScannerResult:
-        local_rules = (
-            "rules:\n"
-            "  - id: argus.python.security.unsafe-eval\n"
-            "    languages: [python]\n"
-            "    message: Avoid eval() when input may be untrusted.\n"
-            "    severity: ERROR\n"
-            "    pattern: eval($VALUE)\n"
+        supported = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rb", ".php", ".c", ".h"}
+        targets = sorted(
+            path for path in target.rglob("*")
+            if path.is_file() and path.suffix.lower() in supported and not path.is_symlink()
         )
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", encoding="utf-8") as rule_file:
-            rule_file.write(local_rules)
-            rule_file.flush()
-            result = _run(
-                [
-                    self._binary() or "semgrep", "scan", "--config", "p/default",
-                    "--config", rule_file.name, "--json", "--metrics=off", "--quiet",
-                    "--no-git-ignore", str(target),
-                ],
-                cwd=target,
-                timeout=timeout,
-            )
+        if not targets:
+            return ScannerResult(self.name, "skipped", [])
+        result = _run(
+            [
+                self._binary() or "semgrep", "scan", "--config", "p/default",
+                "--json", "--metrics=off", "--quiet", "--no-git-ignore",
+                *(str(path) for path in targets),
+            ],
+            cwd=target,
+            timeout=timeout,
+        )
         if result.returncode not in (0, 1):
             raise RuntimeError("Semgrep exited with an error")
+        report = _json_output(result)
+        if report.get("errors"):
+            raise RuntimeError("Semgrep reported scan errors")
+        if not (report.get("paths") or {}).get("scanned"):
+            raise RuntimeError("Semgrep did not scan any target files")
         findings = []
-        for issue in _json_output(result).get("results", []):
+        for issue in report.get("results", []):
             extra = issue.get("extra", {})
             severity = extra.get("severity", "UNKNOWN")
             findings.append(
@@ -461,16 +462,16 @@ def scan_project(
             continue
         try:
             results.append(scanner.scan(target, timeout))
-        except TimeoutError as exc:
-            results.append(ScannerResult(scanner.name, "failed", [], str(exc)))
-        except (RuntimeError, ValueError, OSError) as exc:
-            results.append(ScannerResult(scanner.name, "failed", [], str(exc)))
+        except Exception as exc:
+            error = "Scanner timed out" if isinstance(exc, TimeoutError) else "Scanner output was invalid or execution failed"
+            results.append(ScannerResult(scanner.name, "failed", [], error))
 
     findings = []
     finding_keys = set()
     for result in results:
         for finding in result.findings:
             key = (
+                finding.get("scanner"),
                 finding.get("file"),
                 finding.get("line"),
                 finding.get("rule_id") or finding.get("test_id"),

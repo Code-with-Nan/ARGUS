@@ -3,6 +3,8 @@
 import { useRef, useState } from "react";
 import Link from "next/link";
 import { Archive, Check, CircleAlert, FileArchive, Info, ShieldCheck, Trash2, UploadCloud } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { apiRequest, ApiRequestError } from "@/lib/api";
 
 type SelectedArchive = { file: File; sizeLabel: string };
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
@@ -16,6 +18,9 @@ export function FileUpload() {
   const [selected, setSelected] = useState<SelectedArchive | null>(null);
   const [error, setError] = useState("");
   const [isDragging, setIsDragging] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [successScanId, setSuccessScanId] = useState("");
+  const router = useRouter();
 
   function chooseFile(file?: File) {
     setError("");
@@ -36,6 +41,24 @@ export function FileUpload() {
       return;
     }
     setSelected({ file, sizeLabel: formatSize(file.size) });
+  }
+
+  async function uploadSelectedArchive() {
+    if (!selected) return;
+    setUploading(true);
+    setError("");
+    setSuccessScanId("");
+    const form = new FormData();
+    form.set("file", selected.file);
+    try {
+      const scan = await apiRequest<{ scan_id: string }>("/api/v1/scans/upload", { method: "POST", body: form });
+      setSuccessScanId(scan.scan_id);
+    } catch (caught) {
+      if (caught instanceof ApiRequestError && caught.status === 401) router.replace("/login");
+      else setError("The archive could not be uploaded or scanned.");
+    } finally {
+      setUploading(false);
+    }
   }
 
   return (
@@ -61,9 +84,9 @@ export function FileUpload() {
         </div>
         {error ? <div className="upload-error" role="alert"><CircleAlert size={16} />{error}</div> : null}
         {selected ? <div className="selected-file"><span className="selected-file-icon"><Archive size={17} /></span><span className="selected-file-name"><b>{selected.file.name}</b><small>{selected.sizeLabel} · ZIP archive</small></span><span className="selected-check"><Check size={15} /></span><button type="button" className="icon-button remove-file" aria-label="Remove selected file" onClick={() => { setSelected(null); if (inputRef.current) inputRef.current.value = ""; }}><Trash2 size={15} /></button></div> : null}
-        <div className="upload-privacy"><ShieldCheck size={16} /><span><b>Nothing is uploaded in this preview.</b><small>Your archive stays in this browser. ARGUS does not execute uploaded code.</small></span></div>
-        <div className="upload-progress-shell"><div className="upload-progress-label"><span>Upload progress</span><b>{selected ? "Not started" : "Waiting for archive"}</b></div><div className="upload-progress-track"><span /></div><small>Upload begins only after a secure backend integration is available.</small></div>
-        <button className="button button-disabled scan-start-button" type="button" disabled><span>Backend not connected</span><Info size={15} /></button>
+        <div className="upload-privacy"><ShieldCheck size={16} /><span><b>ZIP validation runs on the backend.</b><small>ARGUS never executes uploaded project code.</small></span></div>
+        <div className="upload-progress-shell"><div className="upload-progress-label"><span>Upload progress</span><b>{uploading ? "Uploading and scanning…" : successScanId ? "Scan completed" : selected ? "Ready to upload" : "Waiting for archive"}</b></div><div className="upload-progress-track"><span /></div><small>Maximum upload size: 10 MB. Maximum extracted size: 50 MB.</small></div>
+        {successScanId ? <Link className="button" href={`/scans/${successScanId}`}>View scan results</Link> : <button className="button scan-start-button" type="button" onClick={uploadSelectedArchive} disabled={!selected || uploading}><span>{uploading ? "Uploading…" : "Upload and scan"}</span><UploadCloud size={15} /></button>}
       </section>
 
       <aside className="upload-aside">

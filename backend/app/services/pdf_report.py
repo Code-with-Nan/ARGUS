@@ -36,13 +36,14 @@ def build_scan_pdf(scan: dict[str, Any]) -> bytes:
         Spacer(1, 12),
         Paragraph(f"<b>Project:</b> {escape(str(scan.get('project_name', 'Unknown')))}", body_style),
         Paragraph(f"<b>Scan ID:</b> {escape(str(scan.get('scan_id', '')))}", body_style),
-        Paragraph(f"<b>Status:</b> {escape(str(scan.get('status', 'unknown')))}", body_style),
-        Paragraph(f"<b>Scanners:</b> {escape(str(scan.get('scanner', 'None')))}", body_style),
+        Paragraph(f"<b>Scan timestamp:</b> {escape(str(scan.get('scan_timestamp', 'Unknown')))}", body_style),
+        Paragraph(f"<b>Status:</b> {escape(str(scan.get('scan_status', scan.get('status', 'unknown'))))}", body_style),
+        Paragraph(f"<b>Scanners:</b> {escape(str(scan.get('scanner', 'scanner execution details below')))}", body_style),
         Paragraph(f"<b>Findings:</b> {int(scan.get('total_findings', 0))}", body_style),
         Spacer(1, 14),
     ]
 
-    coverage = scan.get("scanner_results") or {}
+    coverage = scan.get("scanner_results") or scan.get("scanner_execution") or {}
     if coverage:
         rows = [["Scanner", "Status", "Findings"]]
         for name, result in sorted(coverage.items()):
@@ -68,6 +69,7 @@ def build_scan_pdf(scan: dict[str, Any]) -> bytes:
         scanner = escape(str(finding.get("scanner") or "unknown"))
         severity = escape(str(finding.get("severity") or "unknown"))
         explanation = escape(str(finding.get("explanation") or "No explanation generated."))
+        description = escape(str(finding.get("description") or ""))
         story.extend(
             [
                 Paragraph(f"{index}. {title}", styles["Heading3"]),
@@ -77,11 +79,32 @@ def build_scan_pdf(scan: dict[str, Any]) -> bytes:
                     small_style,
                 ),
                 Paragraph(explanation, body_style),
+                Paragraph(description, body_style) if description else Spacer(1, 1),
                 Spacer(1, 8),
             ]
         )
     if not scan.get("findings"):
         story.append(Paragraph("No findings were recorded for this scan.", body_style))
+
+    story.append(Paragraph("Severity breakdown", styles["Heading2"]))
+    story.append(Paragraph(escape(str(scan.get("severity_breakdown", {}))), body_style))
+    story.append(Paragraph("Remediation status", styles["Heading2"]))
+    story.append(Paragraph(escape(str(scan.get("remediation_status", {}))), body_style))
+    story.append(Paragraph("Verification results", styles["Heading2"]))
+    if scan.get("verification_results"):
+        for result in scan["verification_results"]:
+            story.append(
+                Paragraph(
+                    f"<b>{escape(str(result.get('status', 'NOT_VERIFIED')))}</b>: "
+                    f"{escape(str(result.get('message', 'No verification message')))}",
+                    small_style,
+                )
+            )
+    else:
+        story.append(Paragraph("No remediation verification has been recorded.", body_style))
+    story.append(Paragraph("Limitations", styles["Heading2"]))
+    for limitation in scan.get("limitations", []):
+        story.append(Paragraph(f"- {escape(str(limitation))}", small_style))
 
     document.build(story)
     return output.getvalue()

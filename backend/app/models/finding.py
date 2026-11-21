@@ -13,6 +13,7 @@ class Finding(Base):
         String(36),
         ForeignKey("scans.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
     )
 
     title: Mapped[str] = mapped_column(Text, nullable=False)

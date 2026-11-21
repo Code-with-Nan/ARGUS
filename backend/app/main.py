@@ -1,15 +1,14 @@
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.core.config import settings
-from app.core.database import engine, Base
+from app.core.database import engine
 from app.models import Finding, FindingDetails, Remediation, Scan, ScanMetadata, VerificationResult
+from app.api.auth import router as auth_router
 from app.api.scans import router as scans_router
-
-# Create database tables
-Base.metadata.create_all(bind=engine)
+from app.api.projects import router as projects_router
+from app.schemas.scans import HealthResponse
 
 app = FastAPI(
     title=settings.app_name,
@@ -22,10 +21,12 @@ app.add_middleware(
     allow_origins=[origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
 )
 
+app.include_router(auth_router)
 app.include_router(scans_router)
+app.include_router(projects_router)
 
 
 @app.get("/")
@@ -38,6 +39,7 @@ def root():
 
 
 @app.get("/health")
+@app.get("/api/v1/health", response_model=HealthResponse)
 def health():
     try:
         with engine.connect() as connection:

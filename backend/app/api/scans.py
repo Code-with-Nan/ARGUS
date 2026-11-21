@@ -1,6 +1,6 @@
-
 import hashlib
 import hmac
+import os
 import shutil
 import stat
 import tempfile
@@ -12,19 +12,36 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import Response
+from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import Finding, FindingDetails, Remediation, Scan, ScanMetadata, VerificationResult
-from app.schemas.scans import DecisionRequest, RemediationCreate
+from app.dependencies.auth import get_current_user
+from app.models import Finding, FindingDetails, Remediation, Scan, ScanMetadata, VerificationResult, User
+from app.schemas.scans import (
+    DecisionRequest,
+    FindingsPageResponse,
+    RemediationCreate,
+    ScannerCatalogResponse,
+    ScanDetailResponse,
+    ScanHistoryResponse,
+    SecurityReportResponse,
+)
 from app.services.ai_explainer import explain_finding
-from app.services.remediation import apply_unified_diff, suggest_fix
-from app.services.security_scanner import scan_project
+from app.services.remediation import apply_unified_diff, preview_unified_diff, suggest_fix
+from app.services.security_scanner import scan_project, scanner_catalog
 
 
 router = APIRouter(prefix="/api/v1/scans", tags=["Security Scans"])
+
+
+def _owned_scan(db: Session, scan_id: str, user: User) -> Scan:
+    scan = db.query(Scan).filter(Scan.id == scan_id, Scan.initiated_by_user_id == user.id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found.")
+    return scan
 
 
 def _workspace_root() -> Path:
@@ -54,11 +71,12 @@ def validate_archive(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
         if entry.flag_bits & 0x1:
             raise ValueError("Encrypted ZIP files are not supported")
         path = PurePosixPath(name)
-        if path.is_absolute() or ".." in path.parts or (path.parts and ":" in path.parts[0]):
+        if path.is_absolute() or any(part in (".", "..") for part in path.parts) or (path.parts and ":" in path.parts[0]):
             raise ValueError("Unsafe archive path detected")
-        if name in seen_paths:
+        normalized_name = path.as_posix().rstrip("/")
+        if normalized_name in seen_paths:
             raise ValueError("Duplicate archive entry detected")
-        seen_paths.add(name)
+        seen_paths.add(normalized_name)
         unix_mode = (entry.external_attr >> 16) & 0xFFFF
         file_type = stat.S_IFMT(unix_mode)
         if stat.S_ISLNK(unix_mode):
@@ -67,20 +85,43 @@ def validate_archive(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
             raise ValueError("Special archive files are not allowed")
         if entry.is_dir():
             continue
-        total_size += entry.file_size
-        if total_size > settings.max_extracted_size:
-            raise ValueError("Extracted archive exceeds the configured size limit")
         if entry.file_size < 0 or entry.compress_size < 0:
             raise ValueError("Invalid archive entry size")
+        if entry.file_size > settings.max_zip_entry_size:
+            continue
         if entry.file_size > 0:
             if entry.compress_size == 0:
                 raise ValueError("Suspicious archive compression")
             if entry.file_size / entry.compress_size > settings.max_compression_ratio:
                 raise ValueError("Suspicious compression ratio")
-        files.append(entry)
+        if _is_supported_file(path.name, path.suffix.lower()):
+            total_size += entry.file_size
+            if total_size > settings.max_extracted_size:
+                raise ValueError("Extracted archive exceeds the configured size limit")
+            files.append(entry)
     if not files:
-        raise ValueError("No files found in the ZIP archive")
+        raise ValueError("No supported source or dependency manifest files found in the ZIP archive")
     return files
+
+
+_SUPPORTED_SOURCE_SUFFIXES = {
+    ".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".java",
+    ".go", ".rb", ".php", ".c", ".h", ".cpp", ".hpp", ".cs", ".rs", ".swift",
+    ".kt", ".kts", ".scala", ".sh", ".bash", ".yaml", ".yml", ".toml", ".ini",
+    ".cfg", ".conf", ".properties", ".xml", ".html", ".css", ".sql", ".tf",
+    ".bicep", ".dockerfile", ".md", ".txt", ".json", ".lock",
+}
+_SUPPORTED_MANIFESTS = {
+    "requirements.txt", "requirements-dev.txt", "pyproject.toml", "poetry.lock",
+    "pipfile", "pipfile.lock", "setup.py", "setup.cfg", "package.json",
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    ".semgrepignore", ".gitleaks.toml",
+}
+
+
+def _is_supported_file(filename: str, suffix: str) -> bool:
+    normalized_name = filename.lower()
+    return normalized_name in _SUPPORTED_MANIFESTS or suffix in _SUPPORTED_SOURCE_SUFFIXES
 
 
 def _extract_archive(archive_path: Path, destination: Path) -> None:
@@ -88,8 +129,11 @@ def _extract_archive(archive_path: Path, destination: Path) -> None:
         entries = validate_archive(archive)
         root = destination.resolve()
         total_written = 0
+        extracted_count = 0
         for entry in entries:
             relative = PurePosixPath(entry.filename)
+            if entry.is_dir() or entry.file_size > settings.max_zip_entry_size or not _is_supported_file(relative.name, relative.suffix.lower()):
+                continue
             output_path = (root / Path(*relative.parts)).resolve()
             if not output_path.is_relative_to(root):
                 raise ValueError("Unsafe archive path detected")
@@ -105,6 +149,9 @@ def _extract_archive(archive_path: Path, destination: Path) -> None:
             if written != entry.file_size:
                 raise ValueError("Archive entry size does not match its contents")
             output_path.chmod(0o600)
+            extracted_count += 1
+        if extracted_count == 0:
+            raise ValueError("No supported source or dependency manifest files found in the ZIP archive")
 
 
 def _directory_digest(root: Path) -> str:
@@ -115,6 +162,30 @@ def _directory_digest(root: Path) -> str:
             while chunk := source.read(64 * 1024):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def _copy_managed_workspace(source: Path, destination: Path) -> None:
+    root = _workspace_root()
+    source = source.resolve()
+    if not source.is_relative_to(root) or not source.is_dir() or source.is_symlink():
+        raise ValueError("Managed project copy is unavailable")
+    total_size = 0
+    file_count = 0
+    for path in source.rglob("*"):
+        if path.is_symlink():
+            raise ValueError("Working copy contains an unsupported symbolic link")
+        if path.is_file():
+            file_count += 1
+            total_size += path.stat().st_size
+            if file_count > settings.max_archive_files or total_size > settings.max_extracted_size:
+                raise ValueError("Working copy exceeds configured size limits")
+    if destination.exists():
+        raise ValueError("A remediation working copy already exists")
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    shutil.copytree(source, destination, symlinks=False, copy_function=shutil.copy2)
+    for path in destination.rglob("*"):
+        if path.is_file():
+            path.chmod(0o600)
 
 
 def _finding_payload(db: Session, finding: Finding) -> dict[str, Any]:
@@ -139,6 +210,7 @@ def _finding_payload(db: Session, finding: Finding) -> dict[str, Any]:
             fixed_version=details.fixed_version,
             references=details.references or [],
             metadata=details.metadata_json or {},
+            description=details.description,
             explanation=details.explanation,
             explanation_source=details.explanation_source,
         )
@@ -158,11 +230,16 @@ def _remediation_payload(db: Session, item: Remediation) -> dict[str, Any]:
         "source_scan_id": item.source_scan_id,
         "rationale": item.rationale,
         "suggested_fix": item.suggested_fix,
+        "original_code": item.original_code,
+        "proposed_code": item.proposed_code,
+        "affected_file": item.affected_file,
+        "affected_line": item.affected_line,
         "patch_available": bool(item.patch),
         "status": item.status,
         "approved_by": item.approved_by,
         "approved_at": item.approved_at,
         "applied_scan_id": item.applied_scan_id,
+        "working_copy_created": item.working_copy_path is not None,
         "created_at": item.created_at,
         "verifications": [
             {
@@ -171,6 +248,7 @@ def _remediation_payload(db: Session, item: Remediation) -> dict[str, Any]:
                 "status": result.status,
                 "target_finding_present": result.target_finding_present,
                 "message": result.message,
+                "evidence": result.evidence or {},
                 "created_at": result.created_at,
             }
             for result in verifications
@@ -187,6 +265,7 @@ def _scan_payload(db: Session, scan: Scan, include_findings: bool) -> dict[str, 
         "scanner": scan.scanner,
         "total_findings": scan.total_findings,
         "created_at": scan.created_at,
+        "updated_at": scan.updated_at,
         "scanner_results": metadata.scanner_results if metadata else {},
     }
     if include_findings:
@@ -202,6 +281,45 @@ def _scan_payload(db: Session, scan: Scan, include_findings: bool) -> dict[str, 
     return payload
 
 
+def _security_report(db: Session, scan: Scan) -> dict[str, Any]:
+    payload = _scan_payload(db, scan, include_findings=True)
+    severity_breakdown: dict[str, int] = {}
+    for finding in payload["findings"]:
+        severity = str(finding.get("severity") or "UNKNOWN").upper()
+        severity_breakdown[severity] = severity_breakdown.get(severity, 0) + 1
+    remediations = (
+        db.query(Remediation)
+        .filter(Remediation.source_scan_id == scan.id)
+        .order_by(Remediation.created_at)
+        .all()
+    )
+    remediation_status: dict[str, int] = {}
+    verification_results = []
+    for item in remediations:
+        remediation_status[item.status] = remediation_status.get(item.status, 0) + 1
+        verification_results.extend(_remediation_payload(db, item)["verifications"])
+    scanner_results = payload.get("scanner_results", {})
+    limitations = [
+        f"{name} scanner status: {result.get('status', 'unknown')}"
+        for name, result in scanner_results.items()
+        if result.get("status") != "completed"
+    ]
+    limitations.append("A completed scan is point-in-time evidence and does not prove the project is secure.")
+    return {
+        "project_name": scan.project_name,
+        "scan_id": scan.id,
+        "scan_timestamp": scan.created_at,
+        "scan_status": scan.status,
+        "scanner_execution": scanner_results,
+        "total_findings": scan.total_findings,
+        "severity_breakdown": severity_breakdown,
+        "findings": payload["findings"],
+        "remediation_status": remediation_status,
+        "verification_results": verification_results,
+        "limitations": limitations,
+    }
+
+
 def _run_scan(
     db: Session,
     *,
@@ -210,8 +328,18 @@ def _run_scan(
     project_path: Path,
     source_filename: str | None,
     source_sha256: str | None = None,
+    project_id: str | None = None,
+    initiated_by_user_id: str | None = None,
 ) -> Scan:
-    scan = Scan(id=scan_id, project_name=project_name[:255], status="running", scanner="pending", total_findings=0)
+    scan = Scan(
+        id=scan_id,
+        project_name=project_name[:255],
+        status="running",
+        scanner="pending",
+        total_findings=0,
+        project_id=project_id,
+        initiated_by_user_id=initiated_by_user_id,
+    )
     metadata = ScanMetadata(
         scan_id=scan_id,
         source_path=str(project_path.resolve()),
@@ -232,12 +360,12 @@ def _run_scan(
             timeout=settings.scanner_timeout_seconds,
             include_dependency_audits=settings.include_dependency_audits,
         )
-    except Exception as exc:
+    except Exception:
         scan.status = "failed"
         scan.scanner = "execution error"
         metadata.scanner_results = {"execution": {"status": "failed", "error": "Scanner execution failed"}}
         db.commit()
-        raise RuntimeError("Security scanner failed") from exc
+        return scan
     scan.status = report["status"]
     scan.scanner = report["scanner"][:100]
     scan.total_findings = report["total_findings"]
@@ -265,6 +393,7 @@ def _run_scan(
                 fixed_version=str(item["fixed_version"])[:100] if item.get("fixed_version") else None,
                 references=item.get("references") or [],
                 metadata_json=item.get("metadata") or {},
+                description=item.get("description"),
             )
         )
     try:
@@ -281,10 +410,13 @@ def _run_scan(
     return scan
 
 
-@router.post("/upload")
+@router.post("", response_model=ScanDetailResponse, status_code=201)
+@router.post("/", response_model=ScanDetailResponse, status_code=201, include_in_schema=False)
+@router.post("/upload", response_model=ScanDetailResponse, status_code=201)
 def upload_and_scan(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
     _authorized: None = Depends(_require_api_token),
 ):
     if not file.filename or Path(file.filename.replace("\\", "/")).suffix.lower() != ".zip":
@@ -317,6 +449,7 @@ def upload_and_scan(
             project_path=project_path,
             source_filename=Path(file.filename.replace("\\", "/")).name,
             source_sha256=digest.hexdigest(),
+            initiated_by_user_id=user.id,
         )
         return _scan_payload(db, scan, include_findings=True)
     except HTTPException:
@@ -339,24 +472,60 @@ def upload_and_scan(
         file.file.close()
 
 
-@router.get("")
-@router.get("/")
+@router.get("/scanners", response_model=ScannerCatalogResponse)
+def get_scanners():
+    return {"items": scanner_catalog()}
+
+
+@router.get("", response_model=ScanHistoryResponse)
+@router.get("/", response_model=ScanHistoryResponse, include_in_schema=False)
 def scan_history(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    query = db.query(Scan)
+    query = db.query(Scan).filter(Scan.initiated_by_user_id == user.id)
     total = query.count()
     scans = query.order_by(Scan.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
     return {"items": [_scan_payload(db, scan, False) for scan in scans], "page": page, "page_size": page_size, "total": total}
 
 
-@router.get("/{scan_id}")
-def scan_details(scan_id: str, db: Session = Depends(get_db)):
-    scan = db.get(Scan, scan_id)
+@router.get("/{scan_id}/findings", response_model=FindingsPageResponse)
+def scan_findings(
+    scan_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    severity: str | None = Query(default=None, max_length=20),
+    scanner: str | None = Query(default=None, max_length=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    scan = db.query(Scan).filter(Scan.id == scan_id, Scan.initiated_by_user_id == user.id).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found.")
+    query = (
+        db.query(Finding)
+        .outerjoin(FindingDetails, FindingDetails.finding_id == Finding.id)
+        .filter(Finding.scan_id == scan_id)
+    )
+    if severity:
+        query = query.filter(Finding.severity.ilike(severity.strip()))
+    if scanner:
+        query = query.filter(FindingDetails.scanner.ilike(scanner.strip()))
+    total = query.distinct(Finding.id).count()
+    records = query.order_by(Finding.id).offset((page - 1) * page_size).limit(page_size).all()
+    return {
+        "items": [_finding_payload(db, finding) for finding in records],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+    }
+
+
+@router.get("/{scan_id}", response_model=ScanDetailResponse)
+def scan_details(scan_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    scan = _owned_scan(db, scan_id, user)
     return _scan_payload(db, scan, True)
 
 
@@ -412,9 +581,7 @@ def create_remediation(
         if not metadata or not metadata.source_path:
             raise HTTPException(status_code=409, detail="No managed working copy is available for this scan.")
         try:
-            from app.services.remediation import validate_unified_diff
-
-            validate_unified_diff(metadata.source_path, request.patch)
+            previews = preview_unified_diff(metadata.source_path, request.patch)
         except (OSError, UnicodeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=f"Unsafe remediation patch: {exc}") from exc
     remediation = Remediation(
@@ -424,6 +591,10 @@ def create_remediation(
         rationale=request.rationale or default_rationale,
         suggested_fix=request.suggested_fix or suggestion,
         patch=request.patch,
+        original_code=previews[0][1] if request.patch else finding.code,
+        proposed_code=previews[0][2] if request.patch else None,
+        affected_file=previews[0][0] if request.patch else finding.file,
+        affected_line=finding.line,
         status="pending",
     )
     db.add(remediation)
@@ -485,14 +656,18 @@ def apply_remediation(
     if not source_metadata or not source_scan or not original_finding or not original_details:
         raise HTTPException(status_code=409, detail="The original finding or working copy is unavailable.")
     root = _workspace_root()
-    project_path = Path(source_metadata.source_path or "").resolve()
-    if not project_path.is_relative_to(root) or not project_path.is_dir():
+    source_path = Path(source_metadata.source_path or "").resolve()
+    if not source_path.is_relative_to(root) or not source_path.is_dir():
         raise HTTPException(status_code=410, detail="The stored project working copy is unavailable.")
+    project_path = root / f"remediation-{remediation.id}"
     try:
+        _copy_managed_workspace(source_path, project_path)
         changed_files = apply_unified_diff(project_path, remediation.patch)
     except (OSError, UnicodeError, ValueError) as exc:
+        shutil.rmtree(project_path, ignore_errors=True)
         raise HTTPException(status_code=400, detail=f"Remediation patch was not applied: {exc}") from exc
 
+    remediation.working_copy_path = str(project_path.resolve())
     followup = _run_scan(
         db,
         scan_id=str(uuid4()),
@@ -502,30 +677,39 @@ def apply_remediation(
     )
     followup_metadata = db.get(ScanMetadata, followup.id)
     scanner_status = (followup_metadata.scanner_results or {}).get(original_details.scanner, {})
-    if scanner_status.get("status") != "completed":
-        verification_status = "inconclusive"
+    original_metadata = db.get(ScanMetadata, remediation.source_scan_id)
+    original_status = (original_metadata.scanner_results or {}).get(original_details.scanner, {})
+    if scanner_status.get("status") != "completed" or original_status.get("status") != "completed":
+        verification_status = "VERIFICATION_FAILED"
         target_present = None
-        message = f"Follow-up scan ran, but {original_details.scanner} did not complete; the remediation is not verified."
+        new_signatures: list[list[str]] = []
+        message = f"Original and follow-up {original_details.scanner} scans must both complete; the remediation is not verified."
     else:
+        baseline_findings = db.query(Finding).filter(Finding.scan_id == remediation.source_scan_id).all()
         followup_findings = db.query(Finding).filter(Finding.scan_id == followup.id).all()
-        target_present = False
-        for item in followup_findings:
+        def signature(item: Finding) -> tuple[str, str, str]:
             details = db.get(FindingDetails, item.id)
-            if (
-                details
-                and (details.rule_id == original_details.rule_id if original_details.rule_id else item.test_id == original_finding.test_id)
-                and item.file == original_finding.file
-                and details.scanner == original_details.scanner
-            ):
-                target_present = True
-                break
-        verification_status = "unresolved" if target_present else "verified"
-        message = (
-            f"Follow-up {original_details.scanner} scan detected the target finding after the patch."
-            if target_present
-            else f"Follow-up {original_details.scanner} scan completed and did not detect the target finding."
-        )
-    remediation.status = f"applied_{verification_status}"
+            return (
+                details.scanner if details else "legacy",
+                item.file,
+                details.rule_id if details and details.rule_id else item.test_id,
+            )
+
+        baseline_signatures = {signature(item) for item in baseline_findings}
+        target_signature = signature(original_finding)
+        current_signatures = {signature(item) for item in followup_findings}
+        target_present = target_signature in current_signatures
+        new_signatures = [list(item) for item in sorted(current_signatures - baseline_signatures)]
+        if target_present:
+            verification_status = "STILL_PRESENT"
+            message = f"Follow-up {original_details.scanner} scan detected the target finding after the patch."
+        elif new_signatures:
+            verification_status = "REGRESSION_DETECTED"
+            message = "Follow-up scan cleared the target finding but detected new findings not present in the baseline scan."
+        else:
+            verification_status = "VERIFIED_FIXED"
+            message = f"Follow-up {original_details.scanner} scan completed and did not detect the target finding or new signatures."
+    remediation.status = "applied"
     remediation.applied_scan_id = followup.id
     verification = VerificationResult(
         remediation_id=remediation.id,
@@ -533,6 +717,14 @@ def apply_remediation(
         status=verification_status,
         target_finding_present=target_present,
         message=message,
+        evidence={
+            "baseline_scan_id": remediation.source_scan_id,
+            "followup_scan_id": followup.id,
+            "scanner": original_details.scanner,
+            "scanner_status": scanner_status.get("status"),
+            "new_finding_signatures": new_signatures,
+            "changed_files": changed_files,
+        },
     )
     db.add(verification)
     db.commit()
@@ -548,6 +740,14 @@ def apply_remediation(
     }
 
 
+@router.get("/{scan_id}/report.json", response_model=SecurityReportResponse)
+def scan_report_json(scan_id: str, db: Session = Depends(get_db)):
+    scan = db.get(Scan, scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found.")
+    return _security_report(db, scan)
+
+
 @router.get("/{scan_id}/report.pdf")
 def scan_report_pdf(scan_id: str, db: Session = Depends(get_db)):
     scan = db.get(Scan, scan_id)
@@ -555,7 +755,7 @@ def scan_report_pdf(scan_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Scan not found.")
     from app.services.pdf_report import build_scan_pdf
 
-    content = build_scan_pdf(_scan_payload(db, scan, True))
+    content = build_scan_pdf(_security_report(db, scan))
     return Response(
         content=content,
         media_type="application/pdf",

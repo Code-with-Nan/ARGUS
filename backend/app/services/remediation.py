@@ -140,6 +140,22 @@ def validate_unified_diff(workspace: str | Path, patch: str) -> list[str]:
     return [destination.relative_to(root).as_posix() for destination, _ in _parse_patch(root, patch)]
 
 
+def preview_unified_diff(workspace: str | Path, patch: str) -> list[tuple[str, str, str]]:
+    root = Path(workspace).resolve()
+    if not root.is_dir():
+        raise ValueError("Working copy is unavailable")
+    previews = []
+    for destination, proposed in _parse_patch(root, patch):
+        previews.append(
+            (
+                destination.relative_to(root).as_posix(),
+                destination.read_text(encoding="utf-8"),
+                proposed,
+            )
+        )
+    return previews
+
+
 def apply_unified_diff(workspace: str | Path, patch: str) -> list[str]:
     root = Path(workspace).resolve()
     if not root.is_dir():

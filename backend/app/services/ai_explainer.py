@@ -11,13 +11,36 @@ def _fallback_explanation(finding: dict[str, Any]) -> str:
     severity = str(finding.get("severity") or "unknown").lower()
     location = finding.get("file") or "the reported file"
     package = finding.get("package")
+    rule_id = str(finding.get("rule_id") or finding.get("test_id") or "").lower()
+    title_lower = str(title).lower()
     if package:
         location = f"{location} ({package} {finding.get('installed_version') or ''})"
+    if "eval" in rule_id or "eval" in title_lower:
+        meaning = "The code dynamically evaluates text as executable code."
+        exploit = "If an attacker can influence that text, they may cause the application to execute attacker-chosen expressions."
+        practices = "Use a fixed parser or explicit mapping of allowed operations, and validate inputs against a strict schema."
+    elif "secret" in rule_id or "gitleaks" in str(finding.get("scanner", "")).lower():
+        meaning = "A value matching a credential or secret detection rule was found in the repository."
+        exploit = "If the value is active and exposed, another party may use it to access the associated service or data."
+        practices = "Revoke and rotate the credential, load secrets from a managed secret store, and keep them out of source history."
+    elif package:
+        meaning = "The reported dependency version is associated with a known vulnerability."
+        exploit = "An attacker may trigger the vulnerable dependency behavior through an exposed application path, depending on reachability and configuration."
+        practices = "Upgrade to a scanner-reported fixed release, regenerate the lockfile, and test compatibility."
+    elif "sql" in rule_id or "injection" in title_lower:
+        meaning = "Untrusted input may be interpreted as part of a command or query."
+        exploit = "An attacker may alter the intended operation by supplying specially formed input."
+        practices = "Use parameterized APIs, keep data separate from executable query text, and validate according to the expected input type."
+    else:
+        meaning = "A scanner rule identified a code pattern that can create a security weakness."
+        exploit = "Exploitability depends on whether an attacker can reach the code and control relevant inputs or state."
+        practices = "Follow the scanner rule guidance, apply least privilege, validate untrusted inputs, and add a focused regression test."
     return (
-        f"{title} was reported with {severity} severity at {location}. "
-        "Review the reported rule and affected code or dependency, assess whether the "
-        "risk applies in your environment, and choose a remediation that preserves the "
-        "intended behavior. This explanation is a deterministic fallback, not an AI response."
+        f"{title} was reported with {severity} severity at {location}. What it means: {meaning} "
+        f"Why it matters and potential exploitation: {exploit} "
+        f"Potential impact: unauthorized code execution, data exposure, or service impact may result if the weakness is reachable; assess the actual application context. "
+        f"Secure coding practices and remediation: {practices} "
+        "This is a deterministic, rule-based explanation, not an AI-generated response or proof of exploitability."
     )
 
 
@@ -58,7 +81,7 @@ def explain_finding(
         "messages": [
             {
                 "role": "system",
-                "content": "Explain a software security finding factually. Do not claim a fix is verified. Keep the answer concise.",
+                "content": "Explain what the vulnerability means, why it matters, plausible exploitation conditions, potential impact, secure coding practices, and remediation guidance. Do not claim a fix is verified. Clearly distinguish facts from context-dependent possibilities.",
             },
             {"role": "user", "content": json.dumps(facts, ensure_ascii=True)},
         ],
